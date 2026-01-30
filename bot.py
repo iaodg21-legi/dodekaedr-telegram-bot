@@ -237,7 +237,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/hod — hod kostkou (1× denně)\n"
         "/dnes — zobrazí dnešní scénář\n"
         "/historie — posledních 12 dní\n"
-        "/režim — změna tónu\n"
+        "/rezim — změna tónu\n"
         "/čas — nastavení ráno/večer\n"
         "/stop — pozastavit\n"
     )
