@@ -19,7 +19,7 @@ from telegram.ext import (
 # CONFIG
 # =========================
 TZ = ZoneInfo("Europe/Prague")
-DB_PATH = os.getenv("DB_PATH", "dodekaedr.db")
+DB_PATH = os.getenv("DB_PATH", "/var/data/dodekaedr.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 MORNING_DEFAULT = "07:00"
