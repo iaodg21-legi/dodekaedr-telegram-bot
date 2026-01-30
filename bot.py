@@ -245,7 +245,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # naplánovat notifikace (pokud nejsou)
     await schedule_user_jobs(context, chat_id)
-    await update.message.reply_text("Ráno a večer ti budu připomínat rituál. Pokud chceš změnit časy: /čas")
+    await update.message.reply_text("Ráno a večer ti budu připomínat rituál. Pokud chceš změnit časy: /cas")
 
 async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -322,13 +322,29 @@ async def cmd_cas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     upsert_user(chat_id)
 
-    msg = (
-        "Nastavení času (formát HH:MM)\n"
-        "Použij:\n"
-        "/cas 07:00 21:00\n\n"
-        "První čas = ráno, druhý = večer."
-    )
-    await update.message.reply_text(msg)
+    parts = (update.message.text or "").strip().split()
+    if len(parts) == 1:
+        msg = (
+            "Nastavení času (formát HH:MM)\n"
+            "Použij:\n"
+            "/cas 07:00 21:00\n\n"
+            "První čas = ráno, druhý = večer."
+        )
+        await update.message.reply_text(msg)
+        return
+
+    if len(parts) != 3:
+        await update.message.reply_text("Použití: /cas 07:00 21:00")
+        return
+
+    morning, evening = parts[1], parts[2]
+    if not valid_hhmm(morning) or not valid_hhmm(evening):
+        await update.message.reply_text("Špatný formát. Použij HH:MM (např. 07:00 21:00).")
+        return
+
+    set_user_times(chat_id, morning, evening)
+    await schedule_user_jobs(context, chat_id, force_reschedule=True)
+    await update.message.reply_text(f"Nastaveno. Ráno: {morning}, večer: {evening}")
 
 async def cmd_cas_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
