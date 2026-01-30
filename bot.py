@@ -522,7 +522,7 @@ def main():
     app.add_handler(CommandHandler("hod", cmd_hod))
     app.add_handler(CommandHandler("dnes", cmd_dnes))
     app.add_handler(CommandHandler("historie", cmd_historie))
-    app.add_handler(CommandHandler("režim", cmd_rezim))
+    app.add_handler(CommandHandler("rezim", cmd_rezim))
     app.add_handler(CommandHandler("cas", cmd_cas_set))  # /cas 07:00 21:00
     app.add_handler(CommandHandler("stop", cmd_stop))
 
