@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import http.server
 import socketserver
+import logging
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,15 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # =========================
 # CONFIG
@@ -93,7 +103,7 @@ SCENARIOS = {
 def start_health_server():
     """
     Render Web Service vyžaduje otevřený port (PORT).
-    Tenhle mini-server odpoví 200 OK a udrží deploy zelený.
+    Tento mini-server odpoví 200 OK.
     """
     port = int(os.getenv("PORT", "10000"))
 
@@ -104,10 +114,14 @@ def start_health_server():
             self.wfile.write(b"OK")
 
         def log_message(self, fmt, *args):
-            return  # potlačí log spam
+            return
 
-    httpd = socketserver.TCPServer(("", port), Handler)
+    class ReuseTCPServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    httpd = ReuseTCPServer(("", port), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    logging.info("Health server running on port %s", port)
 
 # =========================
 # DB
@@ -471,12 +485,17 @@ async def schedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int, f
     jname_m = f"morning:{chat_id}"
     jname_e = f"evening:{chat_id}"
 
-    if not force_reschedule:
-        if any(j.name == jname_m for j in context.job_queue.jobs()):
-            return
+    existing = {j.name for j in context.job_queue.jobs()}
+    has_m = jname_m in existing
+    has_e = jname_e in existing
 
-    context.job_queue.run_daily(morning_job, time=morning_t, name=jname_m, chat_id=chat_id)
-    context.job_queue.run_daily(evening_job, time=evening_t, name=jname_e, chat_id=chat_id)
+    if not force_reschedule and has_m and has_e:
+        return
+
+    if not has_m:
+        context.job_queue.run_daily(morning_job, time=morning_t, name=jname_m, chat_id=chat_id)
+    if not has_e:
+        context.job_queue.run_daily(evening_job, time=evening_t, name=jname_e, chat_id=chat_id)
 
 async def unschedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     for j in list(context.job_queue.jobs()):
@@ -510,23 +529,41 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text=copy_evening(mode), reply_markup=kb)
 
 # =========================
+# App lifecycle hooks
+# =========================
+async def post_init(app: Application):
+    me = await app.bot.get_me()
+    logging.info("✅ Bot připojen: @%s (id=%s)", me.username, me.id)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("❌ Exception", exc_info=context.error)
+
+# =========================
 # Main
 # =========================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Chybí BOT_TOKEN (nastav jako env proměnnou).")
 
-    start_health_server()  # Render Web Service: bind to PORT
+    # ensure DB directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    # Render Web Service needs PORT bound
+    start_health_server()
+
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("hod", cmd_hod))
     app.add_handler(CommandHandler("dnes", cmd_dnes))
     app.add_handler(CommandHandler("historie", cmd_historie))
     app.add_handler(CommandHandler("rezim", cmd_rezim))
-    app.add_handler(CommandHandler("cas", cmd_cas))  # /cas nebo /cas 07:00 21:00
+    app.add_handler(CommandHandler("cas", cmd_cas))
     app.add_handler(CommandHandler("stop", cmd_stop))
 
     app.add_handler(CallbackQueryHandler(on_roll_now_callback, pattern="^roll_now$"))
