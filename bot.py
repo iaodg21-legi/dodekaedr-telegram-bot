@@ -259,75 +259,116 @@ def last_12(chat_id: int):
             ORDER BY day DESC
             LIMIT 12
         """, (chat_id,)).fetchall()
-
-# ============================================================
-# Stats
-# ============================================================
-def stats_user(chat_id: int):
+def stats_verdict_counts_all():
     with db() as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM rolls WHERE chat_id=?",
-            (chat_id,),
-        ).fetchone()[0]
-
-        ok_ = conn.execute(
-            "SELECT COUNT(*) FROM rolls WHERE chat_id=? AND verdict='OBSTÁL'",
-            (chat_id,),
-        ).fetchone()[0]
-
-        uhnul = conn.execute(
-            "SELECT COUNT(*) FROM rolls WHERE chat_id=? AND verdict='UHNUL'",
-            (chat_id,),
-        ).fetchone()[0]
-
-        no_v = conn.execute(
-            "SELECT COUNT(*) FROM rolls WHERE chat_id=? AND verdict IS NULL",
-            (chat_id,),
-        ).fetchone()[0]
-
-        top_uhnul = conn.execute("""
-            SELECT plane, COUNT(*) as c
-            FROM rolls
-            WHERE chat_id=? AND verdict='UHNUL'
-            GROUP BY plane
-            ORDER BY c DESC
-            LIMIT 5
-        """, (chat_id,)).fetchall()
-
-        return total, ok_, uhnul, no_v, top_uhnul
-
-def stats_global():
-    with db() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM rolls").fetchone()[0]
-        users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-
-        verdicts = conn.execute("""
-            SELECT COALESCE(verdict, 'BEZ VERDIKTU') as v, COUNT(*) 
+        rows = conn.execute("""
+            SELECT 
+                CASE 
+                    WHEN verdict IS NULL THEN 'BEZ VERDIKTU'
+                    ELSE verdict
+                END as v,
+                COUNT(*) 
             FROM rolls
             GROUP BY v
             ORDER BY COUNT(*) DESC
         """).fetchall()
+        return rows
 
-        top_uhnul = conn.execute("""
-            SELECT plane, COUNT(*) as c
+
+def stats_streaks(chat_id: int):
+    """
+    Vrací:
+    - streak_obstal (kolik dní v řadě OBSTÁL)
+    - streak_bez_uhnul (kolik dní v řadě nebylo UHNUL)
+    """
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT verdict
             FROM rolls
-            WHERE verdict='UHNUL'
-            GROUP BY plane
-            ORDER BY c DESC
-            LIMIT 5
-        """).fetchall()
+            WHERE chat_id=?
+            ORDER BY day DESC
+        """, (chat_id,)).fetchall()
 
-        mode_rates = conn.execute("""
-            SELECT scenario_mode,
-                   SUM(CASE WHEN verdict='OBSTÁL' THEN 1 ELSE 0 END) as ok,
-                   COUNT(*) as n
-            FROM rolls
-            WHERE verdict IS NOT NULL AND scenario_mode IS NOT NULL
-            GROUP BY scenario_mode
-            ORDER BY n DESC
-        """).fetchall()
+    streak_obstal = 0
+    streak_bez_uhnul = 0
 
-        return users, total, verdicts, top_uhnul, mode_rates
+    for (verdict,) in rows:
+        if verdict == "OBSTÁL":
+            streak_obstal += 1
+            streak_bez_uhnul += 1
+        elif verdict == "UHNUL":
+            break
+        else:  # BEZ VERDIKTU
+            streak_bez_uhnul += 1
+            break
+
+    return streak_obstal, streak_bez_uhnul
+
+# ============================================================
+# Stats
+# ============================================================
+async def cmd_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username or ""
+
+    is_admin = username.lower() == "stangzk"
+
+    if is_admin:
+        total = stats_totals()
+        verdicts = stats_verdict_counts_all()
+        top_uhnul = stats_top_uhnul_planes()
+        mode_rates = stats_mode_rates()
+
+        lines = [
+            "/stat — <b>Globální přehled</b>\n",
+            f"Uživatelé: {len(set([r[0] for r in verdicts])) if verdicts else 1}",
+            f"Záznamy: {total}\n",
+            "<b>Verdikty</b>"
+        ]
+
+        for v, c in verdicts:
+            lines.append(f"• {v}: {c}")
+
+        lines.append("\n<b>Nejčastější UHNUL (roviny)</b>")
+        if top_uhnul:
+            for plane, c in top_uhnul:
+                lines.append(f"• {plane}: {c}")
+        else:
+            lines.append("—")
+
+        lines.append("\n<b>Úspěšnost podle režimu</b>")
+        for mode, ok, n in mode_rates:
+            pct = int((ok / n) * 100) if n else 0
+            lines.append(f"• {mode}: {ok}/{n} ({pct} %)")
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # === USER STAT ===
+    streak_obstal, streak_bez_uhnul = stats_streaks(chat_id)
+    verdicts = stats_verdict_counts_all()
+
+    lines = [
+        "/stat — <b>Tvoje stopa</b>\n",
+        "<b>Verdikty</b>"
+    ]
+
+    for v, c in verdicts:
+        lines.append(f"• {v}: {c}")
+
+    lines.extend([
+        "\n<b>Streak</b>",
+        f"• OBSTÁL v řadě: {streak_obstal}",
+        f"• Bez UHNUL: {streak_bez_uhnul}",
+    ])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML
+    )
 
 # ============================================================
 # Core logic
@@ -837,6 +878,7 @@ def main():
     app.add_handler(CommandHandler("stat", cmd_stat))
     app.add_handler(CommandHandler("cas", cmd_cas))
     app.add_handler(CommandHandler("stop", cmd_stop))
+app.add_handler(CommandHandler("stat", cmd_stat))
 
     app.add_handler(CallbackQueryHandler(on_callback))
 
