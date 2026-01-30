@@ -238,7 +238,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/dnes — zobrazí dnešní scénář\n"
         "/historie — posledních 12 dní\n"
         "/rezim — změna tónu\n"
-        "/čas — nastavení ráno/večer\n"
+        "/cas — nastavení ráno/večer\n"
         "/stop — pozastavit\n"
     )
     await update.message.reply_text(text)
