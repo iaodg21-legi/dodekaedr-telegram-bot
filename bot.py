@@ -1,6 +1,9 @@
 import os
 import sqlite3
-from datetime import datetime, date, time, timedelta
+import threading
+import http.server
+import socketserver
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,7 +18,7 @@ from telegram.ext import (
 # =========================
 # CONFIG
 # =========================
-TZ = ZoneInfo("Europe/Prague")  # můžeš změnit později
+TZ = ZoneInfo("Europe/Prague")
 DB_PATH = os.getenv("DB_PATH", "dodekaedr.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
@@ -24,7 +27,6 @@ EVENING_DEFAULT = "21:00"
 
 MODES = ["ZÁKLADNÍ", "TVRDÝ", "LEGIONÁŘSKÝ"]
 
-# 12 rovin (neměnné mapování)
 PLANES = {
     1: "TĚLO",
     2: "NÁVYK",
@@ -40,7 +42,6 @@ PLANES = {
     12: "NASLOUCHÁNÍ",
 }
 
-# MVP scénáře: 1 scénář pro každou rovinu a režim (později rozšíříme)
 SCENARIOS = {
     "ZÁKLADNÍ": {
         1: ("Tělo nelže. My ano.", "Udělej dnes jednu věc pro tělo vědomě."),
@@ -87,6 +88,28 @@ SCENARIOS = {
 }
 
 # =========================
+# Render health server (PORT binding)
+# =========================
+def start_health_server():
+    """
+    Render Web Service vyžaduje otevřený port (PORT).
+    Tenhle mini-server odpoví 200 OK a udrží deploy zelený.
+    """
+    port = int(os.getenv("PORT", "10000"))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, fmt, *args):
+            return  # potlačí log spam
+
+    httpd = socketserver.TCPServer(("", port), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+# =========================
 # DB
 # =========================
 def db() -> sqlite3.Connection:
@@ -127,7 +150,10 @@ def upsert_user(chat_id: int):
 
 def get_user(chat_id: int):
     with db() as conn:
-        cur = conn.execute("SELECT chat_id, mode, morning_time, evening_time, is_enabled FROM users WHERE chat_id=?", (chat_id,))
+        cur = conn.execute(
+            "SELECT chat_id, mode, morning_time, evening_time, is_enabled FROM users WHERE chat_id=?",
+            (chat_id,),
+        )
         return cur.fetchone()
 
 def set_user_mode(chat_id: int, mode: str):
@@ -136,11 +162,17 @@ def set_user_mode(chat_id: int, mode: str):
 
 def set_user_times(chat_id: int, morning: str, evening: str):
     with db() as conn:
-        conn.execute("UPDATE users SET morning_time=?, evening_time=? WHERE chat_id=?", (morning, evening, chat_id))
+        conn.execute(
+            "UPDATE users SET morning_time=?, evening_time=? WHERE chat_id=?",
+            (morning, evening, chat_id),
+        )
 
 def set_user_enabled(chat_id: int, enabled: bool):
     with db() as conn:
-        conn.execute("UPDATE users SET is_enabled=? WHERE chat_id=?", (1 if enabled else 0, chat_id))
+        conn.execute(
+            "UPDATE users SET is_enabled=? WHERE chat_id=?",
+            (1 if enabled else 0, chat_id),
+        )
 
 def today_str() -> str:
     return datetime.now(TZ).date().isoformat()
@@ -155,10 +187,10 @@ def has_roll_for_today(chat_id: int) -> bool:
 
 def get_today_roll(chat_id: int):
     with db() as conn:
-        cur = conn.execute("""
-            SELECT day, number, plane, mode, verdict FROM rolls
-            WHERE chat_id=? AND day=?
-        """, (chat_id, today_str()))
+        cur = conn.execute(
+            "SELECT day, number, plane, mode, verdict FROM rolls WHERE chat_id=? AND day=?",
+            (chat_id, today_str()),
+        )
         return cur.fetchone()
 
 def save_roll(chat_id: int, number: int, plane: str, mode: str):
@@ -170,10 +202,7 @@ def save_roll(chat_id: int, number: int, plane: str, mode: str):
 
 def set_verdict(chat_id: int, verdict: str):
     with db() as conn:
-        conn.execute("""
-            UPDATE rolls SET verdict=?
-            WHERE chat_id=? AND day=?
-        """, (verdict, chat_id, today_str()))
+        conn.execute("UPDATE rolls SET verdict=? WHERE chat_id=? AND day=?", (verdict, chat_id, today_str()))
 
 def last_12(chat_id: int):
     with db() as conn:
@@ -186,17 +215,8 @@ def last_12(chat_id: int):
         """, (chat_id,))
         return cur.fetchall()
 
-def users_enabled():
-    with db() as conn:
-        cur = conn.execute("""
-            SELECT chat_id, mode, morning_time, evening_time
-            FROM users
-            WHERE is_enabled=1
-        """)
-        return cur.fetchall()
-
 # =========================
-# UX COPY (short)
+# UX COPY
 # =========================
 def copy_morning(mode: str) -> str:
     if mode == "LEGIONÁŘSKÝ":
@@ -222,30 +242,36 @@ def format_scenario(mode: str, number: int) -> str:
         f"Stav: <i>Uzamčeno do 24:00.</i>"
     )
 
+def valid_hhmm(s: str) -> bool:
+    try:
+        hh, mm = s.split(":")
+        h = int(hh); m = int(mm)
+        return 0 <= h <= 23 and 0 <= m <= 59
+    except Exception:
+        return False
+
 # =========================
 # Telegram handlers
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     upsert_user(chat_id)
-    u = get_user(chat_id)
 
     text = (
         "DODEKAEDR — digitální disciplína reality\n\n"
         "Princip: Hoď. Přijmi. Neuhýbej.\n\n"
         "Příkazy:\n"
         "/hod — hod kostkou (1× denně)\n"
-        "/dnes — zobrazí dnešní scénář\n"
+        "/dnes — dnešní scénář\n"
         "/historie — posledních 12 dní\n"
         "/rezim — změna tónu\n"
-        "/cas — nastavení ráno/večer\n"
+        "/cas 07:00 21:00 — nastavení ráno/večer\n"
         "/stop — pozastavit\n"
     )
     await update.message.reply_text(text)
 
-    # naplánovat notifikace (pokud nejsou)
     await schedule_user_jobs(context, chat_id)
-    await update.message.reply_text("Ráno a večer ti budu připomínat rituál. Pokud chceš změnit časy: /cas")
+    await update.message.reply_text("Ráno a večer ti připomenu rituál. Časy změníš: /cas 07:00 21:00")
 
 async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -253,7 +279,6 @@ async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = get_user(chat_id)
     mode = u[1]
 
-    # vynucení včerejšího verdiktu není v MVP (zavedeme v další iteraci)
     if has_roll_for_today(chat_id):
         row = get_today_roll(chat_id)
         number = row[1]
@@ -261,8 +286,6 @@ async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
-    # deterministická náhoda: číslo podle dne + chat_id (stabilní pro den, ale "náhodné" pro člověka)
-    # pokud chceš čistě náhodné, změním na random.SystemRandom()
     seed = int(datetime.now(TZ).strftime("%Y%m%d")) + chat_id
     number = (seed % 12) + 1
 
@@ -281,10 +304,12 @@ async def cmd_dnes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(chat_id)
     u = get_user(chat_id)
     mode = u[1]
+
     row = get_today_roll(chat_id)
     if not row:
         await update.message.reply_text("Dnes ještě nebyl hod. Použij: /hod")
         return
+
     number = row[1]
     msg = format_scenario(mode, number)
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -346,23 +371,6 @@ async def cmd_cas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await schedule_user_jobs(context, chat_id, force_reschedule=True)
     await update.message.reply_text(f"Nastaveno. Ráno: {morning}, večer: {evening}")
 
-async def cmd_cas_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    upsert_user(chat_id)
-
-    parts = update.message.text.strip().split()
-    if len(parts) != 3:
-        await update.message.reply_text("Použití: /cas 07:00 21:00")
-        return
-    morning, evening = parts[1], parts[2]
-    if not valid_hhmm(morning) or not valid_hhmm(evening):
-        await update.message.reply_text("Špatný formát. Použij HH:MM (např. 07:00 21:00).")
-        return
-
-    set_user_times(chat_id, morning, evening)
-    await schedule_user_jobs(context, chat_id, force_reschedule=True)
-    await update.message.reply_text(f"Nastaveno. Ráno: {morning}, večer: {evening}")
-
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     upsert_user(chat_id)
@@ -398,6 +406,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not has_roll_for_today(chat_id):
             await query.message.reply_text("Dnes ještě nebyl hod. /hod")
             return
+
         set_verdict(chat_id, verdict)
         if verdict == "OBSTÁL":
             text = "Charakter obstál." if mode == "LEGIONÁŘSKÝ" else ("Udržel jsi strukturu." if mode == "TVRDÝ" else "Zůstáváš ve tvaru.")
@@ -414,19 +423,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"Režim nastaven: {new_mode}")
         return
 
-def valid_hhmm(s: str) -> bool:
-    try:
-        hh, mm = s.split(":")
-        h = int(hh); m = int(mm)
-        return 0 <= h <= 23 and 0 <= m <= 59
-    except Exception:
-        return False
+async def on_roll_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat.id
+    upsert_user(chat_id)
+    u = get_user(chat_id)
+    mode = u[1]
+
+    if has_roll_for_today(chat_id):
+        row = get_today_roll(chat_id)
+        number = row[1]
+        msg = format_scenario(mode, number)
+        await query.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+
+    seed = int(datetime.now(TZ).strftime("%Y%m%d")) + chat_id
+    number = (seed % 12) + 1
+    plane = PLANES[number]
+    save_roll(chat_id, number, plane, mode)
+
+    msg = format_scenario(mode, number)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("PŘIJÍMÁM", callback_data="accept")],
+        [InlineKeyboardButton("VERDIKT", callback_data="verdict")],
+    ])
+    await query.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 # =========================
 # Scheduling (JobQueue)
 # =========================
 async def schedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int, force_reschedule: bool = False):
-    # odstranění starých jobů (pokud existují)
     if force_reschedule:
         await unschedule_user_jobs(context, chat_id)
 
@@ -440,27 +468,15 @@ async def schedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int, f
     morning_t = time(int(morning_str.split(":")[0]), int(morning_str.split(":")[1]), tzinfo=TZ)
     evening_t = time(int(evening_str.split(":")[0]), int(evening_str.split(":")[1]), tzinfo=TZ)
 
-    # job names unique
     jname_m = f"morning:{chat_id}"
     jname_e = f"evening:{chat_id}"
 
-    # pokud už job existuje, nereschedulovat
     if not force_reschedule:
         if any(j.name == jname_m for j in context.job_queue.jobs()):
             return
 
-    context.job_queue.run_daily(
-        morning_job,
-        time=morning_t,
-        name=jname_m,
-        chat_id=chat_id,
-    )
-    context.job_queue.run_daily(
-        evening_job,
-        time=evening_t,
-        name=jname_e,
-        chat_id=chat_id,
-    )
+    context.job_queue.run_daily(morning_job, time=morning_t, name=jname_m, chat_id=chat_id)
+    context.job_queue.run_daily(evening_job, time=evening_t, name=jname_e, chat_id=chat_id)
 
 async def unschedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     for j in list(context.job_queue.jobs()):
@@ -482,8 +498,8 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
     if not u or u[4] != 1:
         return
     mode = u[1]
+
     if not has_roll_for_today(chat_id):
-        # tichá připomínka bez tlaku
         await context.bot.send_message(chat_id=chat_id, text="Dnes ještě nebyl hod. /hod")
         return
 
@@ -493,35 +509,6 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
     ])
     await context.bot.send_message(chat_id=chat_id, text=copy_evening(mode), reply_markup=kb)
 
-async def on_roll_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    # emulace /hod
-    fake_update = Update(update.update_id, message=None)
-    # zavoláme přímo cmd_hod přes message není, tak zavoláme logiku inline:
-    chat_id = query.message.chat.id
-    upsert_user(chat_id)
-    u = get_user(chat_id)
-    mode = u[1]
-
-    if has_roll_for_today(chat_id):
-        row = get_today_roll(chat_id)
-        number = row[1]
-        msg = format_scenario(mode, number)
-        await query.message.reply_text(msg, parse_mode=ParseMode.HTML)
-        return
-
-    seed = int(datetime.now(TZ).strftime("%Y%m%d")) + chat_id
-    number = (seed % 12) + 1
-    plane = PLANES[number]
-    save_roll(chat_id, number, plane, mode)
-    msg = format_scenario(mode, number)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("PŘIJÍMÁM", callback_data="accept")],
-        [InlineKeyboardButton("VERDIKT", callback_data="verdict")],
-    ])
-    await query.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
 # =========================
 # Main
 # =========================
@@ -529,24 +516,22 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("Chybí BOT_TOKEN (nastav jako env proměnnou).")
 
+    start_health_server()  # Render Web Service: bind to PORT
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("hod", cmd_hod))
     app.add_handler(CommandHandler("dnes", cmd_dnes))
     app.add_handler(CommandHandler("historie", cmd_historie))
     app.add_handler(CommandHandler("rezim", cmd_rezim))
-    app.add_handler(CommandHandler("cas", cmd_cas_set))  # /cas 07:00 21:00
+    app.add_handler(CommandHandler("cas", cmd_cas))  # /cas nebo /cas 07:00 21:00
     app.add_handler(CommandHandler("stop", cmd_stop))
 
-    # callbacks
     app.add_handler(CallbackQueryHandler(on_roll_now_callback, pattern="^roll_now$"))
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # start polling
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
