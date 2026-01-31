@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import http.server
 import socketserver
+import logging
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from html import escape as h
@@ -17,19 +18,30 @@ from telegram.ext import (
 )
 
 # ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("dodekaedr")
+
+# ============================================================
 # CONFIG
 # ============================================================
 TZ = ZoneInfo("Europe/Prague")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Persistent volume path (Render/Railway). Když nemáš volume, dej "dodekaedr.db".
 DB_PATH = os.getenv("DB_PATH", "/var/data/dodekaedr.db")
 
-ADMIN_USERNAME = "stangzk"  # bez @
-APP_LINK = os.getenv("APP_LINK", "").strip()
+# admin username bez @
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "stangzk").strip().lower()
 
 MORNING_DEFAULT = "07:00"
 EVENING_DEFAULT = "21:00"
+
+APP_LINK = os.getenv("APP_LINK", "").strip()  # volitelný link do /start
 
 MODES = ["ZÁKLADNÍ", "TVRDÝ", "LEGIONÁŘSKÝ"]
 
@@ -94,13 +106,7 @@ SCENARIOS = {
 }
 
 # ============================================================
-# Anti-spam pro pending stav (UX dotažení)
-# ============================================================
-# Klíč: (chat_id, day) -> True
-PENDING_NOTICE_CACHE: dict[tuple[int, str], bool] = {}
-
-# ============================================================
-# Health server
+# HEALTH SERVER (PORT binding)
 # ============================================================
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
@@ -127,8 +133,8 @@ def db() -> sqlite3.Connection:
     return conn
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    cols = conn.execute(f"PRAGMA table_info({table});").fetchall()
-    return {c[1] for c in cols}
+    rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
+    return {r[1] for r in rows}
 
 def init_db():
     with db() as conn:
@@ -157,14 +163,16 @@ def init_db():
         """)
 
         cols = _table_columns(conn, "rolls")
+        if "number" not in cols:
+            conn.execute("ALTER TABLE rolls ADD COLUMN number INTEGER NOT NULL DEFAULT 0;")
+        if "plane" not in cols:
+            conn.execute("ALTER TABLE rolls ADD COLUMN plane TEXT NOT NULL DEFAULT '';")
         if "scenario_mode" not in cols:
             conn.execute("ALTER TABLE rolls ADD COLUMN scenario_mode TEXT DEFAULT NULL;")
         if "pending" not in cols:
             conn.execute("ALTER TABLE rolls ADD COLUMN pending INTEGER NOT NULL DEFAULT 0;")
         if "verdict" not in cols:
             conn.execute("ALTER TABLE rolls ADD COLUMN verdict TEXT DEFAULT NULL;")
-        if "plane" not in cols:
-            conn.execute("ALTER TABLE rolls ADD COLUMN plane TEXT NOT NULL DEFAULT '';")
         if "rolled_at" not in cols:
             conn.execute("ALTER TABLE rolls ADD COLUMN rolled_at TEXT NOT NULL DEFAULT '';")
 
@@ -212,14 +220,16 @@ def get_today_roll(chat_id: int):
 
 def is_pending_today(chat_id: int) -> bool:
     row = get_today_roll(chat_id)
-    return (row is not None) and (int(row[4]) == 1 or not row[3])
+    return bool(row) and (int(row[4]) == 1 or not row[3])
 
 def save_pending_roll(chat_id: int, number: int):
     plane = PLANES[number]
     with db() as conn:
         conn.execute("""
-            INSERT OR REPLACE INTO rolls (chat_id, day, number, plane, scenario_mode, pending, verdict, rolled_at)
-            VALUES (?, ?, ?, ?, NULL, 1, NULL, ?)
+            INSERT OR REPLACE INTO rolls
+                (chat_id, day, number, plane, scenario_mode, pending, verdict, rolled_at)
+            VALUES
+                (?, ?, ?, ?, NULL, 1, NULL, ?)
         """, (chat_id, today_str(), number, plane, now_iso()))
 
 def finalize_roll_mode(chat_id: int, mode: str):
@@ -249,47 +259,55 @@ def last_12(chat_id: int):
         """, (chat_id,)).fetchall()
 
 # ============================================================
-# Stats (komplet)
+# STATS
 # ============================================================
-def stats_totals() -> int:
+def stats_user_verdict_counts(chat_id: int):
     with db() as conn:
-        return conn.execute("SELECT COUNT(*) FROM rolls").fetchone()[0]
+        return conn.execute("""
+            SELECT
+                CASE WHEN verdict IS NULL THEN 'BEZ VERDIKTU' ELSE verdict END as v,
+                COUNT(*) as c
+            FROM rolls
+            WHERE chat_id=?
+            GROUP BY v
+            ORDER BY c DESC
+        """, (chat_id,)).fetchall()
 
-def stats_user_count() -> int:
+def stats_global_verdict_counts():
     with db() as conn:
-        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        return conn.execute("""
+            SELECT
+                CASE WHEN verdict IS NULL THEN 'BEZ VERDIKTU' ELSE verdict END as v,
+                COUNT(*) as c
+            FROM rolls
+            GROUP BY v
+            ORDER BY c DESC
+        """).fetchall()
 
-def stats_verdict_counts_all_for_chat(chat_id: int | None = None):
-    q = """
-        SELECT
-            CASE WHEN verdict IS NULL THEN 'BEZ VERDIKTU' ELSE verdict END as v,
-            COUNT(*)
-        FROM rolls
-    """
-    params = ()
-    if chat_id is not None:
-        q += " WHERE chat_id=?"
-        params = (chat_id,)
-    q += " GROUP BY v ORDER BY COUNT(*) DESC"
+def stats_user_top_uhnul_planes(chat_id: int, limit: int = 5):
     with db() as conn:
-        return conn.execute(q, params).fetchall()
+        return conn.execute("""
+            SELECT plane, COUNT(*) as c
+            FROM rolls
+            WHERE chat_id=? AND verdict='UHNUL'
+            GROUP BY plane
+            ORDER BY c DESC
+            LIMIT ?
+        """, (chat_id, limit)).fetchall()
 
-def stats_top_uhnul_planes(chat_id: int | None = None, limit: int = 5):
-    q = """
-        SELECT plane, COUNT(*) as c
-        FROM rolls
-        WHERE verdict='UHNUL'
-    """
-    params = ()
-    if chat_id is not None:
-        q += " AND chat_id=?"
-        params = (chat_id,)
-    q += " GROUP BY plane ORDER BY c DESC LIMIT ?"
-    params = params + (limit,)
+def stats_global_top_uhnul_planes(limit: int = 5):
     with db() as conn:
-        return conn.execute(q, params).fetchall()
+        return conn.execute("""
+            SELECT plane, COUNT(*) as c
+            FROM rolls
+            WHERE verdict='UHNUL'
+            GROUP BY plane
+            ORDER BY c DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
 
-def stats_mode_rates():
+def stats_global_mode_rates():
+    # pozor: scenario_mode je uložený v rolls (tón pro ten den)
     with db() as conn:
         return conn.execute("""
             SELECT scenario_mode,
@@ -301,10 +319,23 @@ def stats_mode_rates():
             ORDER BY n DESC
         """).fetchall()
 
+def stats_counts_total(chat_id: int | None = None):
+    with db() as conn:
+        if chat_id is None:
+            return conn.execute("SELECT COUNT(*) FROM rolls").fetchone()[0]
+        return conn.execute("SELECT COUNT(*) FROM rolls WHERE chat_id=?", (chat_id,)).fetchone()[0]
+
+def stats_users_total():
+    with db() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if n:
+            return n
+        return conn.execute("SELECT COUNT(DISTINCT chat_id) FROM rolls").fetchone()[0]
+
 def stats_streaks(chat_id: int):
     """
-    - streak_obstal: kolik dní v řadě OBSTÁL (od posledního dne zpět, končí na prvním, co není OBSTÁL)
-    - streak_bez_uhnul: kolik dní v řadě není UHNUL (OBSTÁL nebo BEZ VERDIKTU; končí na UHNUL)
+    streak_obstal: kolik posledních DOKONČENÝCH dní v řadě OBSTÁL (stop na UHNUL nebo NULL)
+    streak_bez_uhnul: kolik dní v řadě nebylo UHNUL (NULL se započte a stop)
     """
     with db() as conn:
         rows = conn.execute("""
@@ -324,39 +355,21 @@ def stats_streaks(chat_id: int):
             continue
         if verdict == "UHNUL":
             break
-        # BEZ VERDIKTU
+        # NULL / BEZ VERDIKTU
         streak_bez_uhnul += 1
         break
 
     return streak_obstal, streak_bez_uhnul
 
-def stats_global():
-    users = stats_user_count()
-    total = stats_totals()
-    verdicts = stats_verdict_counts_all_for_chat(None)
-    top_uhnul = stats_top_uhnul_planes(None, 5)
-    mode_rates = stats_mode_rates()
-    return users, total, verdicts, top_uhnul, mode_rates
-
-def stats_user(chat_id: int):
-    verdicts = dict(stats_verdict_counts_all_for_chat(chat_id))
-    total = sum(verdicts.values()) if verdicts else 0
-    ok_ = verdicts.get("OBSTÁL", 0)
-    uhnul = verdicts.get("UHNUL", 0)
-    no_v = verdicts.get("BEZ VERDIKTU", 0)
-    top_uhnul = stats_top_uhnul_planes(chat_id, 5)
-    streak_obstal, streak_bez_uhnul = stats_streaks(chat_id)
-    return total, ok_, uhnul, no_v, top_uhnul, streak_obstal, streak_bez_uhnul
-
 # ============================================================
-# Core logic
+# CORE
 # ============================================================
 def daily_number(chat_id: int) -> int:
     seed = int(datetime.now(TZ).strftime("%Y%m%d")) + int(chat_id)
     return (seed % 12) + 1
 
 # ============================================================
-# Copy / UX
+# COPY / UX
 # ============================================================
 def start_text() -> str:
     link_line = f"\n\n<b>Odkaz</b>\n{h(APP_LINK)}" if APP_LINK else ""
@@ -381,7 +394,7 @@ def msg_no_roll_yet() -> str:
     return "Dnes ještě nepadl hod.\nPoužij /hod."
 
 def msg_pending_pick_mode() -> str:
-    return "Zvol tón dne:"
+    return "Rovina dne je určená.\nTeď zvol tón:"
 
 def msg_mode_default_set(mode: str) -> str:
     return f"Výchozí tón nastaven: {mode}"
@@ -416,17 +429,8 @@ def copy_evening(mode: str) -> str:
 
 def verdict_reply(mode: str, verdict: str) -> str:
     if verdict == "OBSTÁL":
-        if mode == "LEGIONÁŘSKÝ":
-            return "Udržel jsi linii."
-        if mode == "TVRDÝ":
-            return "Udržel jsi tvar."
-        return "Zůstal jsi ve směru."
-    else:
-        if mode == "LEGIONÁŘSKÝ":
-            return "Zapsáno.\nTeď s tím pracuj."
-        if mode == "TVRDÝ":
-            return "Pravda zapsaná.\nBez omluv."
-        return "Zapsáno.\nZítra znovu."
+        return "Udržel jsi linii." if mode == "LEGIONÁŘSKÝ" else ("Udržel jsi tvar." if mode == "TVRDÝ" else "Zůstal jsi ve směru.")
+    return "Zapsáno.\nTeď s tím pracuj." if mode == "LEGIONÁŘSKÝ" else ("Pravda zapsaná.\nBez omluv." if mode == "TVRDÝ" else "Zapsáno.\nZítra znovu.")
 
 def format_scenario(mode: str, number: int) -> str:
     plane = PLANES[number]
@@ -461,10 +465,10 @@ def valid_hhmm(s: str) -> bool:
 
 def is_admin(update: Update) -> bool:
     u = update.effective_user
-    return bool(u and u.username and u.username.lower() == ADMIN_USERNAME.lower())
+    return bool(u and u.username and u.username.strip().lower() == ADMIN_USERNAME)
 
 # ============================================================
-# Flow helper
+# FLOW HELPERS
 # ============================================================
 async def show_today_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     row = get_today_roll(chat_id)
@@ -474,22 +478,31 @@ async def show_today_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
     _day, number, _plane, scenario_mode, pending, _verdict = row
     if int(pending) == 1 or not scenario_mode:
-        await context.bot.send_message(chat_id=chat_id, text=msg_pending_pick_mode(), reply_markup=mode_keyboard("pick:"))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=msg_pending_pick_mode(),
+            reply_markup=mode_keyboard(prefix="pick:")
+        )
         return
 
     msg = format_scenario(scenario_mode, int(number))
     await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, reply_markup=action_keyboard())
 
 # ============================================================
-# Telegram handlers
+# HANDLERS
 # ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     upsert_user(chat_id)
 
     await update.message.reply_text(start_text(), parse_mode=ParseMode.HTML)
+
+    # plánování jen pokud job_queue existuje
     await schedule_user_jobs(context, chat_id)
-    await update.message.reply_text("Ráno a večer přijde připomínka.\nRytmus změníš: /cas 07:00 21:00")
+    if getattr(context, "job_queue", None) is None:
+        await update.message.reply_text("Pozn.: připomínky jsou teď vypnuté (hosting nemá job queue).")
+    else:
+        await update.message.reply_text("Ráno a večer přijde připomínka.\nRytmus změníš: /cas 07:00 21:00")
 
 async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -497,69 +510,35 @@ async def cmd_hod(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     row = get_today_roll(chat_id)
     if row:
-        day, number, plane, scenario_mode, pending, _verdict = row
-
-        # UX DOTAŽENÍ: když je pending, neposílej dokola stejnou klávesnici
+        _day, number, _plane, scenario_mode, pending, _verdict = row
         if int(pending) == 1 or not scenario_mode:
-            key = (chat_id, day)
-            if PENDING_NOTICE_CACHE.get(key):
-                await update.message.reply_text(f"Dnes už padlo <b>{number} — {h(plane)}</b>.\nVyber tón na tlačítkách výše.", parse_mode=ParseMode.HTML)
-                return
-
-            PENDING_NOTICE_CACHE[key] = True
-            await update.message.reply_text(f"🎲 <b>{number} — {h(plane)}</b>\n\n{msg_pending_pick_mode()}",
-                                           parse_mode=ParseMode.HTML,
-                                           reply_markup=mode_keyboard("pick:"))
+            await update.message.reply_text(msg_pending_pick_mode(), reply_markup=mode_keyboard(prefix="pick:"))
             return
-
-        # už uzamčeno -> ukaž scénář
         msg = format_scenario(scenario_mode, int(number))
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=action_keyboard())
         return
 
-    # první /hod dne -> vytvoř pending a nabídni tón
     number = daily_number(chat_id)
     save_pending_roll(chat_id, number)
-    PENDING_NOTICE_CACHE[(chat_id, today_str())] = True  # aby další /hod už jen připomněl
     await update.message.reply_text(
         f"🎲 <b>{number} — {h(PLANES[number])}</b>\n\n{msg_pending_pick_mode()}",
         parse_mode=ParseMode.HTML,
-        reply_markup=mode_keyboard("pick:"),
+        reply_markup=mode_keyboard(prefix="pick:"),
     )
 
 async def cmd_dnes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     upsert_user(chat_id)
-
-    row = get_today_roll(chat_id)
-    if not row:
-        await update.message.reply_text(msg_no_roll_yet())
-        return
-
-    day, number, plane, scenario_mode, pending, _verdict = row
-    if int(pending) == 1 or not scenario_mode:
-        key = (chat_id, day)
-        if PENDING_NOTICE_CACHE.get(key):
-            await update.message.reply_text(f"Dnes už padlo <b>{number} — {h(plane)}</b>.\nVyber tón na tlačítkách výše.", parse_mode=ParseMode.HTML)
-            return
-        PENDING_NOTICE_CACHE[key] = True
-        await update.message.reply_text(f"🎲 <b>{number} — {h(plane)}</b>\n\n{msg_pending_pick_mode()}",
-                                       parse_mode=ParseMode.HTML,
-                                       reply_markup=mode_keyboard("pick:"))
-        return
-
-    msg = format_scenario(scenario_mode, int(number))
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=action_keyboard())
+    await show_today_status(context, chat_id)
 
 async def cmd_rezim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     upsert_user(chat_id)
 
     if is_pending_today(chat_id):
-        await update.message.reply_text("Dnes je rovina určená. Zvol tón pro dnešek:", reply_markup=mode_keyboard("pick:"))
+        await update.message.reply_text("Dnes je rovina určená. Zvol tón pro dnešek:", reply_markup=mode_keyboard(prefix="pick:"))
         return
-
-    await update.message.reply_text("Zvol výchozí tón:", reply_markup=mode_keyboard("default:"))
+    await update.message.reply_text("Zvol výchozí tón:", reply_markup=mode_keyboard(prefix="default:"))
 
 async def cmd_historie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -581,6 +560,7 @@ async def cmd_historie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_cas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # když není job_queue, nemá smysl to nastavovat – ale uložíme časy do DB
     chat_id = update.effective_chat.id
     upsert_user(chat_id)
 
@@ -588,7 +568,6 @@ async def cmd_cas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) == 1:
         await update.message.reply_text(msg_times_help())
         return
-
     if len(parts) != 3:
         await update.message.reply_text("Použití: /cas 07:00 21:00")
         return
@@ -614,10 +593,14 @@ async def cmd_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(chat_id)
 
     if is_admin(update):
-        users, total, verdicts, top_uhnul, mode_rates = stats_global()
+        users = stats_users_total()
+        total = stats_counts_total(None)
+        verdicts = stats_global_verdict_counts()
+        top_uhnul = stats_global_top_uhnul_planes()
+        mode_rates = stats_global_mode_rates()
 
-        v_lines = [f"• {v}: {c}" for v, c in verdicts] if verdicts else ["—"]
-        t_lines = [f"• {p}: {c}" for p, c in top_uhnul] if top_uhnul else ["—"]
+        v_lines = [f"• {v}: {c}" for v, c in verdicts] or ["—"]
+        t_lines = [f"• {plane}: {c}" for plane, c in top_uhnul] or ["—"]
         m_lines = []
         for mode, ok, n in mode_rates:
             rate = (ok / n * 100.0) if n else 0.0
@@ -636,33 +619,42 @@ async def cmd_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
         return
 
-    total, ok_, uhnul, no_v, top_uhnul, streak_ok, streak_no_uhnul = stats_user(chat_id)
+    # user view
+    total = stats_counts_total(chat_id)
+    verdicts = stats_user_verdict_counts(chat_id)
+    streak_obstal, streak_bez_uhnul = stats_streaks(chat_id)
+    top_uhnul = stats_user_top_uhnul_planes(chat_id)
+
+    # vyrob součty pro rychlou orientaci
+    ok_ = next((c for v, c in verdicts if v == "OBSTÁL"), 0)
+    uhnul = next((c for v, c in verdicts if v == "UHNUL"), 0)
+    no_v = next((c for v, c in verdicts if v == "BEZ VERDIKTU"), 0)
     rate = (ok_ / (ok_ + uhnul) * 100.0) if (ok_ + uhnul) else 0.0
 
-    top_lines = [f"• {p}: {c}" for p, c in top_uhnul] if top_uhnul else ["—"]
+    top_lines = [f"• {plane}: {c}" for plane, c in top_uhnul] or ["—"]
+    v_lines = [f"• {v}: {c}" for v, c in verdicts] or ["—"]
 
     text = (
         "<b>/stat — Tvoje stopa</b>\n\n"
-        f"Záznamy: <b>{total}</b>\n"
-        f"OBSTÁL: <b>{ok_}</b>\n"
-        f"UHNUL: <b>{uhnul}</b>\n"
-        f"BEZ VERDIKTU: <b>{no_v}</b>\n\n"
+        f"Záznamy: <b>{total}</b>\n\n"
+        "<b>Verdikty</b>\n" + "\n".join(v_lines) +
+        "\n\n<b>Streak</b>\n"
+        f"• OBSTÁL v řadě: <b>{streak_obstal}</b>\n"
+        f"• Bez UHNUL: <b>{streak_bez_uhnul}</b>\n\n"
         f"Úspěšnost (z verdiktů): <b>{rate:.0f} %</b>\n\n"
-        "<b>Streak</b>\n"
-        f"• OBSTÁL v řadě: <b>{streak_ok}</b>\n"
-        f"• Bez UHNUL: <b>{streak_no_uhnul}</b>\n\n"
         "<b>Kde nejčastěji uhýbáš</b>\n" + "\n".join(top_lines)
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 # ============================================================
-# Callback handler
+# CALLBACKS
 # ============================================================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
     data = (query.data or "").strip()
+
     upsert_user(chat_id)
 
     if data == "accept":
@@ -678,7 +670,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         _day, _number, _plane, scenario_mode, pending, _verdict = row
         if int(pending) == 1 or not scenario_mode:
-            await query.message.reply_text("Nejdřív zvol tón pro dnešek.", reply_markup=mode_keyboard("pick:"))
+            await query.message.reply_text("Nejdřív zvol tón pro dnešek.", reply_markup=mode_keyboard(prefix="pick:"))
             return
 
         kb = InlineKeyboardMarkup([
@@ -694,9 +686,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row:
             await query.message.reply_text(msg_no_roll_yet())
             return
+
         _day, _number, _plane, scenario_mode, pending, _verdict = row
         if int(pending) == 1 or not scenario_mode:
-            await query.message.reply_text("Nejdřív zvol tón pro dnešek.", reply_markup=mode_keyboard("pick:"))
+            await query.message.reply_text("Nejdřív zvol tón pro dnešek.", reply_markup=mode_keyboard(prefix="pick:"))
             return
 
         set_verdict(chat_id, verdict)
@@ -713,8 +706,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Nejdřív hoď: /hod")
             return
 
-        day, number, _plane, scenario_mode, pending, _verdict = row
-
+        _day, number, _plane, scenario_mode, pending, _verdict = row
         if int(pending) == 0 and scenario_mode:
             set_user_mode(chat_id, mode)
             await query.message.reply_text(f"Dnešek už je uzamčený.\n{msg_mode_default_set(mode)}")
@@ -722,9 +714,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         finalize_roll_mode(chat_id, mode)
         set_user_mode(chat_id, mode)
-
-        # Jakmile je uzamčeno, pending cache je už irelevantní
-        PENDING_NOTICE_CACHE.pop((chat_id, day), None)
 
         msg = format_scenario(mode, int(number))
         await query.message.reply_text(f"Režim: {mode}")
@@ -740,26 +729,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "roll_now":
+        # pokud ještě nebyl hod, udělej hod
         row = get_today_roll(chat_id)
         if not row:
             number = daily_number(chat_id)
             save_pending_roll(chat_id, number)
-            PENDING_NOTICE_CACHE[(chat_id, today_str())] = True
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"🎲 <b>{number} — {h(PLANES[number])}</b>\n\n{msg_pending_pick_mode()}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=mode_keyboard("pick:"),
+                reply_markup=mode_keyboard(prefix="pick:"),
             )
             return
-
         await show_today_status(context, chat_id)
         return
 
 # ============================================================
-# Scheduling (JobQueue)
+# JOB QUEUE (safe)
 # ============================================================
 async def schedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int, force_reschedule: bool = False):
+    jq = getattr(context, "job_queue", None)
+    if jq is None:
+        return
+
     if force_reschedule:
         await unschedule_user_jobs(context, chat_id)
 
@@ -776,14 +768,17 @@ async def schedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int, f
     jname_m = f"morning:{chat_id}"
     jname_e = f"evening:{chat_id}"
 
-    if not force_reschedule and any(j.name == jname_m for j in context.job_queue.jobs()):
+    if not force_reschedule and any(j.name == jname_m for j in jq.jobs()):
         return
 
-    context.job_queue.run_daily(morning_job, time=morning_t, name=jname_m, chat_id=chat_id)
-    context.job_queue.run_daily(evening_job, time=evening_t, name=jname_e, chat_id=chat_id)
+    jq.run_daily(morning_job, time=morning_t, name=jname_m, chat_id=chat_id)
+    jq.run_daily(evening_job, time=evening_t, name=jname_e, chat_id=chat_id)
 
 async def unschedule_user_jobs(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    for j in list(context.job_queue.jobs()):
+    jq = getattr(context, "job_queue", None)
+    if jq is None:
+        return
+    for j in list(jq.jobs()):
         if j.name in (f"morning:{chat_id}", f"evening:{chat_id}"):
             j.schedule_removal()
 
@@ -792,7 +787,6 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE):
     u = get_user(chat_id)
     if not u or int(u[4]) != 1:
         return
-
     default_mode = u[1]
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("HOĎ", callback_data="roll_now")]])
     await context.bot.send_message(chat_id=chat_id, text=copy_morning(default_mode), reply_markup=kb)
@@ -820,7 +814,13 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text=copy_evening(scenario_mode), reply_markup=kb)
 
 # ============================================================
-# Main
+# ERROR HANDLER
+# ============================================================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled exception", exc_info=context.error)
+
+# ============================================================
+# MAIN
 # ============================================================
 def main():
     if not BOT_TOKEN:
@@ -841,6 +841,7 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
 
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
 
     app.run_polling(close_loop=False)
 
